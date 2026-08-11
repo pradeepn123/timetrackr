@@ -133,6 +133,7 @@ body::before{
 
 .field-row{display:flex;gap:0.8rem;flex-wrap:wrap;margin-bottom:1rem;}
 .field{flex:1;min-width:180px;position:relative;}
+.field.field-narrow{flex:0 1 160px;min-width:140px;}
 .field label{
   display:block;
   font-size:0.7rem;
@@ -363,6 +364,21 @@ td.attach button{
 }
 td.attach button:hover{border-color:var(--ink-soft);color:var(--ink);}
 td.attach .none{color:var(--ink-soft);}
+
+.status-badge{
+  display:inline-block;
+  padding:0.18rem 0.55rem;
+  font-size:0.72rem;
+  font-weight:600;
+  text-transform:none;
+  letter-spacing:0.02em;
+  border-radius:999px;
+  border:1px solid transparent;
+  white-space:nowrap;
+}
+.status-badge.status-in_progress{background:rgba(76,107,63,0.14);color:var(--green);border-color:rgba(76,107,63,0.35);}
+.status-badge.status-on_hold{background:rgba(200,121,31,0.14);color:var(--amber-deep);border-color:rgba(200,121,31,0.35);}
+.status-badge.status-completed{background:rgba(107,101,88,0.14);color:var(--ink-soft);border-color:var(--rule);}
 
 .modal-overlay{
   position:fixed;inset:0;background:var(--overlay-bg);

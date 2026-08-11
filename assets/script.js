@@ -3,10 +3,21 @@
   let timerState = null; // {startTs, project, task, remark, segmentStartTs, accumulatedMs}
   let tickHandle = null;
 
+  // Project status is a property of the project itself (one row per
+  // user+project name in the `projects` table), not of each logged entry —
+  // changing it here updates what's shown for every entry under that project.
+  const STATUS_META = {
+    in_progress: { label: 'In Progress', cls: 'status-in_progress' },
+    on_hold: { label: 'On Hold', cls: 'status-on_hold' },
+    completed: { label: 'Completed', cls: 'status-completed' }
+  };
+  let projectsStatus = {}; // { [projectName]: 'in_progress' | 'on_hold' | 'completed' }
+
   const clockDisplay = document.getElementById('clockDisplay');
   const startBtn = document.getElementById('startBtn');
   const stopBtn = document.getElementById('stopBtn');
   const projectInput = document.getElementById('project');
+  const projectStatusSelect = document.getElementById('projectStatus');
   const taskInput = document.getElementById('task');
   const remarkInput = document.getElementById('remark');
   const deck = document.getElementById('deck');
@@ -239,6 +250,41 @@
     renderTable();
   }
 
+  async function loadProjectsStatus(){
+    try{
+      const { data, error } = await supabaseClient.from('projects').select('name, status');
+      if(error) throw error;
+      projectsStatus = {};
+      (data || []).forEach(row => { projectsStatus[row.name] = row.status; });
+    }catch(e){
+      console.error('Could not load project statuses', e);
+      projectsStatus = {};
+    }
+  }
+
+  function syncStatusSelectToProject(){
+    const name = projectInput.value.trim();
+    projectStatusSelect.value = (name && projectsStatus[name]) || 'in_progress';
+  }
+
+  async function saveProjectStatus(name, status){
+    if(!name) return;
+    try{
+      const { error } = await supabaseClient
+        .from('projects')
+        .upsert({ user_id: WorkLogAuth.currentUser.id, name, status }, { onConflict: 'user_id,name' });
+      if(error) throw error;
+      projectsStatus[name] = status;
+      renderTable(); // reflect the change on every entry row under this project
+    }catch(e){
+      console.error('Could not save project status', e);
+    }
+  }
+
+  projectStatusSelect.addEventListener('change', ()=>{
+    saveProjectStatus(projectInput.value.trim(), projectStatusSelect.value);
+  });
+
   async function loadTimerState(){
     try{
       const raw = storageGet('work-log-active-timer');
@@ -276,6 +322,7 @@
     lunchBreakBtn.disabled = isRunning && isBreak; // can't start a break while already on one
     teaBreakBtn.disabled = isRunning && isBreak;
     projectInput.disabled = isRunning;
+    projectStatusSelect.disabled = isRunning;
     taskInput.disabled = isRunning;
     remarkInput.disabled = isRunning;
     deck.classList.toggle('running', isRunning);
@@ -364,6 +411,7 @@
     }
     hintText.style.color = '';
     hideProjectDropdown();
+    if(!projectsStatus[project]) await saveProjectStatus(project, projectStatusSelect.value);
     await beginTimer(project, task, remark, false);
   });
 
@@ -403,13 +451,17 @@
 
   projectInput.addEventListener('focus', showProjectDropdown);
   projectInput.addEventListener('input', showProjectDropdown);
-  projectInput.addEventListener('blur', ()=> setTimeout(hideProjectDropdown, 150));
+  projectInput.addEventListener('blur', ()=>{
+    setTimeout(hideProjectDropdown, 150);
+    syncStatusSelectToProject();
+  });
   projectDropdown.addEventListener('mousedown', (e)=>{
     e.preventDefault();
     const target = e.target.closest('[data-project]');
     if(!target) return;
     projectInput.value = target.getAttribute('data-project');
     hideProjectDropdown();
+    syncStatusSelectToProject();
   });
 
   async function stopTimerInternal(endTsOverride){
@@ -710,10 +762,11 @@
       { header: 'Date', key: 'date', width: 12 },
       { header: 'Start Time', key: 'start', width: 12 },
       { header: 'Project', key: 'project', width: 20 },
+      { header: 'Project Status', key: 'projectStatus', width: 14 },
       { header: 'Work/Task Description', key: 'task', width: 45 },
       { header: 'End Time', key: 'end', width: 12 },
       { header: 'Duration', key: 'duration', width: 10 },
-      { header: 'Status', key: 'status', width: 12 },
+      { header: 'Entry Type', key: 'status', width: 12 },
       { header: 'Remark', key: 'remark', width: 30 },
       { header: 'Screenshots', key: 'screenshots', width: 50 },
       { header: 'URLs', key: 'urls', width: 30 }
@@ -745,6 +798,7 @@
         date: showDate ? e.dateDisplay : '',
         start: e.start,
         project: e.project,
+        projectStatus: e.isBreak ? '' : (STATUS_META[projectsStatus[e.project] || 'in_progress'].label),
         task: e.task,
         end: e.end,
         duration: fmtDuration(e.totalMs),
@@ -926,10 +980,15 @@
         : `<span class="none">—</span>`;
       const projectLabel = e.isBreak ? '☕ ' + escapeHtml(e.project) : escapeHtml(e.project);
       const breakTypeCell = e.isBreak ? escapeHtml(e.task) : `<span class="none">—</span>`;
+      const statusMeta = e.isBreak ? null : STATUS_META[projectsStatus[e.project] || 'in_progress'];
+      const statusCell = statusMeta
+        ? `<span class="status-badge ${statusMeta.cls}">${statusMeta.label}</span>`
+        : `<span class="none">—</span>`;
       return `<tr${e.isBreak ? ' class="break-row"' : ''}>
         <td class="num">${i+1}</td>
         <td class="time">${escapeHtml(e.dateDisplay)}</td>
         <td>${projectLabel}</td>
+        <td>${statusCell}</td>
         <td>${breakTypeCell}</td>
         <td>${escapeHtml(e.task)}</td>
         <td>${escapeHtml(e.remark || '')}</td>
@@ -942,7 +1001,7 @@
     }).join('');
     tableWrap.innerHTML = `<table>
       <thead><tr>
-        <th>#</th><th>Date</th><th>Project</th><th>Break Type</th><th>Task Description</th><th>Remark</th><th>Attachments</th>
+        <th>#</th><th>Date</th><th>Project</th><th>Status</th><th>Break Type</th><th>Task Description</th><th>Remark</th><th>Attachments</th>
         <th>Start</th><th>End</th><th>Total</th><th></th>
       </tr></thead>
       <tbody>${rows}</tbody>
@@ -1014,9 +1073,11 @@
   function resetAppState(){
     entries = [];
     timerState = null;
+    projectsStatus = {};
     stopTick();
     deck.classList.remove('running', 'paused');
     projectInput.value = '';
+    projectStatusSelect.value = 'in_progress';
     taskInput.value = '';
     remarkInput.value = '';
     setRunningUI(false);
@@ -1025,7 +1086,7 @@
 
   document.addEventListener('worklog:auth-change', (e)=>{
     if(e.detail.user){
-      loadEntries().then(loadTimerState);
+      Promise.all([loadEntries(), loadProjectsStatus()]).then(loadTimerState);
     }else{
       resetAppState();
     }
@@ -1040,7 +1101,7 @@
   // we get here, we know we missed it and load directly instead of waiting
   // for an event that already happened.
   if(window.WorkLogAuth && WorkLogAuth.currentUser){
-    loadEntries().then(loadTimerState);
+    Promise.all([loadEntries(), loadProjectsStatus()]).then(loadTimerState);
   }
 
   // Fired by migrate-local.js after it's pushed local entries into Supabase,

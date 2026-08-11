@@ -49,6 +49,39 @@ drop policy if exists entries_delete_own on public.entries;
 create policy entries_delete_own on public.entries
   for delete using (auth.uid() = user_id);
 
+-- Projects: one row per (user, project name), tracking that project's status.
+-- Entries keep storing the project name as free text (unchanged); this table
+-- is only consulted to look up/display a project's current status.
+create table if not exists public.projects (
+  id          uuid primary key default gen_random_uuid(),
+  user_id     uuid not null references auth.users(id) on delete cascade default auth.uid(),
+  name        text not null,
+  status      text not null default 'in_progress' check (status in ('in_progress','on_hold','completed')),
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now(),
+  unique (user_id, name)
+);
+
+create index if not exists projects_user_id_idx on public.projects (user_id);
+
+alter table public.projects enable row level security;
+
+drop policy if exists projects_select_own on public.projects;
+create policy projects_select_own on public.projects
+  for select using (auth.uid() = user_id);
+
+drop policy if exists projects_insert_own on public.projects;
+create policy projects_insert_own on public.projects
+  for insert with check (auth.uid() = user_id);
+
+drop policy if exists projects_update_own on public.projects;
+create policy projects_update_own on public.projects
+  for update using (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+drop policy if exists projects_delete_own on public.projects;
+create policy projects_delete_own on public.projects
+  for delete using (auth.uid() = user_id);
+
 -- Screenshots: private bucket, one folder per user (`${userId}/${screenshotId}`).
 -- Original filenames are kept only in entries.screenshots jsonb, not in the
 -- storage path, so we never have to worry about escaping special characters.
