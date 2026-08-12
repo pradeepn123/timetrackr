@@ -572,7 +572,14 @@
   //  2) Page Visibility API fallback — works in every browser. Locking the
   //     screen reliably makes the page "hidden" everywhere, so this is used
   //     whenever the Idle Detection API isn't active. Its trade-off is that
-  //     switching tabs/apps also counts as "hidden".
+  //     switching tabs/apps also counts as "hidden" — so instead of pausing
+  //     the moment it's hidden, this layer only records *when* it went
+  //     hidden and decides once it's visible again: a gap shorter than
+  //     TAB_HIDDEN_GRACE_MS (a quick tab switch or app-switcher glance) is
+  //     ignored entirely — the timer just kept running the whole time, no
+  //     entry gets split. Only a gap at or past that grace period is treated
+  //     as a real screen-off and logged/split, same as the Idle Detection API
+  //     path.
   // On top of both, clicking anywhere after the screen comes back on is a
   // safety net that logs/restarts the timer even if the automatic handling
   // missed.
@@ -597,6 +604,11 @@
   let idlePermissionRequested = false;
   let usingIdleDetector = false;
 
+  // Matches the Idle Detection API threshold below, so both layers agree on
+  // what counts as "actually away" versus a brief tab switch.
+  const TAB_HIDDEN_GRACE_MS = 60000;
+  let hiddenAt = null;
+
   // A page refresh/navigation also fires visibilitychange(hidden) right
   // before the page tears down — indistinguishable from a real screen lock
   // by that event alone. beforeunload/pagehide fire earlier in that specific
@@ -606,12 +618,13 @@
   window.addEventListener('beforeunload', ()=>{ isUnloading = true; });
   window.addEventListener('pagehide', ()=>{ isUnloading = true; });
 
-  async function pauseForScreenOff(reason){
+  async function pauseForScreenOff(reason, atTs){
     if(!timerState || timerState.segmentStartTs == null) return; // nothing running to pause
     if(timerState.isBreak) return; // let a Lunch/Tea break keep counting through screen-off instead of pausing it
-    timerState.accumulatedMs += Date.now() - timerState.segmentStartTs;
+    const pauseTs = atTs != null ? atTs : Date.now();
+    timerState.accumulatedMs += pauseTs - timerState.segmentStartTs;
     timerState.segmentStartTs = null;
-    timerState.pausedAt = Date.now(); // the real "end time" of this segment, used when we log it at resume
+    timerState.pausedAt = pauseTs; // the real "end time" of this segment, used when we log it at resume
     pauseTick();
     deck.classList.add('paused');
     hintText.textContent = 'Timer paused at ' + fmtClock(timerState.accumulatedMs) + ' — screen ' + reason + '. This task will be logged and a new one started once the screen is back on.';
@@ -663,8 +676,16 @@
   document.addEventListener('visibilitychange', async ()=>{
     if(usingIdleDetector) return; // handled more precisely by the Idle Detection API instead
     if(isUnloading) return; // this hidden event is from a refresh/navigation, not a real screen lock
-    if(document.hidden) await pauseForScreenOff('turned off');
-    else await resumeForScreenOn();
+    if(document.hidden){
+      hiddenAt = Date.now();
+      return;
+    }
+    if(hiddenAt == null) return; // nothing was pending (e.g. an unload flag suppressed the hide)
+    const wasHiddenAt = hiddenAt;
+    hiddenAt = null;
+    if(Date.now() - wasHiddenAt < TAB_HIDDEN_GRACE_MS) return; // brief tab switch — timer kept running, nothing to split
+    await pauseForScreenOff('turned off', wasHiddenAt);
+    await resumeForScreenOn();
   });
 
   // Fallback restart trigger: clicking anywhere restarts an auto-stopped
