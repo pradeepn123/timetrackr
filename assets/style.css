@@ -78,7 +78,7 @@ body::before{
 @media (prefers-reduced-motion: reduce){
   body::before{ animation:none; }
 }
-.wrap{max-width:900px;margin:0 auto;padding:2rem 1.5rem 4rem;position:relative;z-index:1;}
+.wrap{max-width:1200px;margin:0 auto;padding:2rem 1.5rem 4rem;position:relative;z-index:1;}
 
 .masthead{
   display:flex;

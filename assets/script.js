@@ -1,6 +1,6 @@
 (function(){
   let entries = [];
-  let timerState = null; // {startTs, project, task, remark, segmentStartTs, accumulatedMs}
+  let timerState = null; // {startTs, project, task, segmentStartTs, accumulatedMs}
   let tickHandle = null;
 
   // Project status is a property of the project itself (one row per
@@ -19,7 +19,6 @@
   const projectInput = document.getElementById('project');
   const projectStatusSelect = document.getElementById('projectStatus');
   const taskInput = document.getElementById('task');
-  const remarkInput = document.getElementById('remark');
   const deck = document.getElementById('deck');
   const hintText = document.getElementById('hintText');
   const tableWrap = document.getElementById('tableWrap');
@@ -203,7 +202,6 @@
       dateDisplay: row.date_display,
       project: row.project,
       task: row.task,
-      remark: row.remark || '',
       screenshots: row.screenshots || [],
       urls: row.urls || [],
       startTs: row.start_ts,
@@ -223,7 +221,6 @@
       date_display: entry.dateDisplay,
       project: entry.project,
       task: entry.task,
-      remark: entry.remark || '',
       screenshots: entry.screenshots || [],
       urls: entry.urls || [],
       start_ts: entry.startTs,
@@ -295,7 +292,6 @@
         // logged here; only pressing Stop logs an entry.
         projectInput.value = timerState.project;
         taskInput.value = timerState.task;
-        remarkInput.value = timerState.remark || '';
         setRunningUI(true, timerState.isBreak);
         if(timerState.segmentStartTs != null){
           startTick();
@@ -324,7 +320,6 @@
     projectInput.disabled = isRunning;
     projectStatusSelect.disabled = isRunning;
     taskInput.disabled = isRunning;
-    remarkInput.disabled = isRunning;
     deck.classList.toggle('running', isRunning);
     deck.classList.toggle('on-break', isRunning && !!isBreak);
     hintText.textContent = isRunning
@@ -390,9 +385,9 @@
     clockDisplay.textContent = '00:00:00';
   }
 
-  async function beginTimer(project, task, remark, isBreak){
+  async function beginTimer(project, task, isBreak){
     const now = Date.now();
-    timerState = { startTs: now, project, task, remark, segmentStartTs: now, accumulatedMs: 0, isBreak: !!isBreak };
+    timerState = { startTs: now, project, task, segmentStartTs: now, accumulatedMs: 0, isBreak: !!isBreak };
     setRunningUI(true, isBreak);
     startTick();
     await saveTimerState();
@@ -403,7 +398,6 @@
   startBtn.addEventListener('click', async ()=>{
     const project = projectInput.value.trim();
     const task = taskInput.value.trim();
-    const remark = remarkInput.value.trim();
     if(!project || !task){
       hintText.textContent = 'Add both a project and a task description before starting.';
       hintText.style.color = 'var(--red)';
@@ -412,7 +406,7 @@
     hintText.style.color = '';
     hideProjectDropdown();
     if(!projectsStatus[project]) await saveProjectStatus(project, projectStatusSelect.value);
-    await beginTimer(project, task, remark, false);
+    await beginTimer(project, task, false);
   });
 
   const lunchBreakBtn = document.getElementById('lunchBreakBtn');
@@ -423,7 +417,7 @@
       await stopTimerInternal(); // log whatever task was running before starting the break
     }
     if(!timerState){
-      await beginTimer('Break', label, '', true);
+      await beginTimer('Break', label, true);
     }
   }
 
@@ -470,7 +464,7 @@
     const startDate = new Date(timerState.startTs);
     const endDate = new Date(endTs);
     const totalMs = currentElapsedMs(); // excludes any paused (screen-off) intervals
-    const { project, task, remark, startTs, isBreak } = timerState;
+    const { project, task, startTs, isBreak } = timerState;
 
     // Finalize state synchronously (before any await) so a concurrent event —
     // e.g. the click-anywhere resume listener firing while the screenshot
@@ -497,7 +491,6 @@
       dateDisplay: fmtDisplayDate(startDate),
       project,
       task,
-      remark: remark || '',
       screenshots,
       urls,
       startTs,
@@ -541,7 +534,6 @@
       dateDisplay: fmtDisplayDate(startDate),
       project: 'Break',
       task,
-      remark: '',
       screenshots: [],
       urls: [],
       startTs,
@@ -570,7 +562,6 @@
     await stopTimerInternal();
     projectInput.value = '';
     taskInput.value = '';
-    remarkInput.value = '';
   });
 
   // Screen lock/off detection. Two layers:
@@ -597,6 +588,11 @@
   // timer starts for the same task from the moment the screen came back on.
   // The gap between off and on is never counted in either entry — i.e. it's
   // treated as a break.
+  //
+  // Exception: while a Lunch/Tea break is running, screen-off is the whole
+  // point (you've stepped away), so it must count toward the break instead
+  // of interrupting it — pauseForScreenOff below is a no-op for breaks, and
+  // the elapsed time keeps accumulating into that same break entry.
   let idleDetector = null;
   let idlePermissionRequested = false;
   let usingIdleDetector = false;
@@ -612,6 +608,7 @@
 
   async function pauseForScreenOff(reason){
     if(!timerState || timerState.segmentStartTs == null) return; // nothing running to pause
+    if(timerState.isBreak) return; // let a Lunch/Tea break keep counting through screen-off instead of pausing it
     timerState.accumulatedMs += Date.now() - timerState.segmentStartTs;
     timerState.segmentStartTs = null;
     timerState.pausedAt = Date.now(); // the real "end time" of this segment, used when we log it at resume
@@ -622,25 +619,22 @@
   }
 
   async function resumeForScreenOn(){
+    // Never true for a break (pauseForScreenOff no-ops for breaks, so a
+    // break's segmentStartTs is never nulled) — this only ever fires for a
+    // paused task.
     if(!timerState || timerState.segmentStartTs !== null) return; // not paused
-    const { project, task, remark, pausedAt, isBreak } = timerState;
+    const { project, task, pausedAt } = timerState;
     const screenOnAt = Date.now();
     await stopTimerInternal(pausedAt); // logs the frozen segment, ending at the actual screen-off moment
 
-    if(!isBreak){
-      // The screen-off gap itself becomes its own visible Break entry, so the
-      // log clearly shows why there's a hole between this task and the next
-      // — it wasn't already a break, so there's nothing else representing it.
-      await logBreakEntry('Screen off', pausedAt, screenOnAt);
-    }
+    // The screen-off gap itself becomes its own visible Break entry, so the
+    // log clearly shows why there's a hole between this task and the next.
+    await logBreakEntry('Screen off', pausedAt, screenOnAt);
 
     projectInput.value = project;
     taskInput.value = task;
-    remarkInput.value = remark;
-    await beginTimer(project, task, remark, isBreak);
-    hintText.textContent = isBreak
-      ? 'Screen back on — resumed your break.'
-      : 'Screen back on — logged the previous segment (with a break for the time the screen was off) and started a new timer for "' + task + '".';
+    await beginTimer(project, task, false);
+    hintText.textContent = 'Screen back on — logged the previous segment (with a break for the time the screen was off) and started a new timer for "' + task + '".';
   }
 
   async function ensureIdleDetector(){
@@ -767,7 +761,6 @@
       { header: 'End Time', key: 'end', width: 12 },
       { header: 'Duration', key: 'duration', width: 10 },
       { header: 'Entry Type', key: 'status', width: 12 },
-      { header: 'Remark', key: 'remark', width: 30 },
       { header: 'Screenshots', key: 'screenshots', width: 50 },
       { header: 'URLs', key: 'urls', width: 30 }
     ];
@@ -803,7 +796,6 @@
         end: e.end,
         duration: fmtDuration(e.totalMs),
         status: e.isBreak ? 'Break' : '',
-        remark: e.remark || '',
         screenshots: await getScreenshotLinksText(e.screenshots),
         urls: (e.urls || []).join(', ')
       });
@@ -991,7 +983,6 @@
         <td>${statusCell}</td>
         <td>${breakTypeCell}</td>
         <td>${escapeHtml(e.task)}</td>
-        <td>${escapeHtml(e.remark || '')}</td>
         <td class="attach">${attachCell}</td>
         <td class="time">${escapeHtml(e.start)}</td>
         <td class="time">${escapeHtml(e.end)}</td>
@@ -1001,7 +992,7 @@
     }).join('');
     tableWrap.innerHTML = `<table>
       <thead><tr>
-        <th>#</th><th>Date</th><th>Project</th><th>Status</th><th>Break Type</th><th>Task Description</th><th>Remark</th><th>Attachments</th>
+        <th>#</th><th>Date</th><th>Project</th><th>Status</th><th>Break Type</th><th>Task Description</th><th>Attachments</th>
         <th>Start</th><th>End</th><th>Total</th><th></th>
       </tr></thead>
       <tbody>${rows}</tbody>
@@ -1079,7 +1070,6 @@
     projectInput.value = '';
     projectStatusSelect.value = 'in_progress';
     taskInput.value = '';
-    remarkInput.value = '';
     setRunningUI(false);
     renderTable();
   }
