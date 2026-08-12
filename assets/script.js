@@ -49,6 +49,72 @@
     try{ localStorage.removeItem(key); }catch(e){ console.error('Storage remove failed', e); }
   }
 
+  // Finished entries (a Stop, a break, an auto-logged screen-off segment)
+  // must never just vanish if the save to Supabase fails — e.g. an access
+  // token that expired during a 1-2 hour idle stretch, or a flaky
+  // connection. Every insert therefore goes through insertEntryRow, which:
+  //   1) proactively refreshes the session first (getSession() refreshes an
+  //      expired token under the hood when the refresh token is still
+  //      valid — this alone fixes the common case).
+  //   2) if the insert still fails, queues the already-built row in
+  //      localStorage instead of dropping it, so it survives a refresh and
+  //      gets retried automatically (on reconnect, on next login, on tab
+  //      focus, and on a periodic timer) until it lands.
+  const PENDING_ENTRIES_KEY = 'work-log-pending-entries';
+
+  function loadPendingEntries(){
+    try{ return JSON.parse(storageGet(PENDING_ENTRIES_KEY) || '[]'); }catch(e){ return []; }
+  }
+  function savePendingEntries(list){
+    if(list.length === 0) storageRemove(PENDING_ENTRIES_KEY);
+    else storageSet(PENDING_ENTRIES_KEY, JSON.stringify(list));
+  }
+  function queuePendingEntry(row){
+    const list = loadPendingEntries();
+    list.push(row);
+    savePendingEntries(list);
+  }
+
+  async function insertEntryRow(row){
+    try{
+      await supabaseClient.auth.getSession(); // refreshes the access token first if it's expired
+      const { data, error } = await supabaseClient.from('entries').insert(row).select().single();
+      if(error) throw error;
+      return data;
+    }catch(e){
+      console.error('Could not save entry — queueing locally to retry', e);
+      return null;
+    }
+  }
+
+  let flushingPendingEntries = false;
+
+  async function flushPendingEntries(){
+    if(flushingPendingEntries) return;
+    const pending = loadPendingEntries();
+    if(pending.length === 0) return;
+    flushingPendingEntries = true;
+    const stillPending = [];
+    let recovered = 0;
+    for(const row of pending){
+      const data = await insertEntryRow(row);
+      if(data){
+        recovered++;
+        const idx = entries.findIndex(e => e.id === row.id);
+        const mapped = mapRowToEntry(data);
+        if(idx > -1) entries[idx] = mapped; else entries.push(mapped);
+      }else{
+        stillPending.push(row);
+      }
+    }
+    savePendingEntries(stillPending);
+    flushingPendingEntries = false;
+    if(recovered > 0) renderTable();
+  }
+
+  window.addEventListener('online', flushPendingEntries);
+  setInterval(flushPendingEntries, 2 * 60 * 1000);
+
   // Screenshots live in the private Supabase Storage bucket "screenshots",
   // one folder per user (`${userId}/${screenshotId}`) — storage RLS policies
   // enforce that a user can only read/write objects under their own folder.
@@ -244,7 +310,12 @@
       console.error('Could not load entries', e);
       entries = [];
     }
+    // Anything still stuck in the local retry queue (never made it to
+    // Supabase yet) wouldn't be in that server response — show it anyway so
+    // it isn't invisible while flushPendingEntries keeps trying in the background.
+    loadPendingEntries().forEach(row => entries.push(mapRowToEntry(row)));
     renderTable();
+    flushPendingEntries();
   }
 
   async function loadProjectsStatus(){
@@ -500,25 +571,29 @@
       totalMs,
       isBreak: !!isBreak
     };
-    try{
-      const { data, error } = await supabaseClient
-        .from('entries')
-        .insert(mapEntryToRow(entry))
-        .select()
-        .single();
-      if(error) throw error;
+    const row = mapEntryToRow(entry);
+    const data = await insertEntryRow(row);
+    if(data){
       entries.push(mapRowToEntry(data));
-    }catch(e){
-      console.error('Could not save entry', e);
-      hintText.textContent = 'Could not save this entry — check your connection and try again.';
-      hintText.style.color = 'var(--red)';
+    }else{
+      queuePendingEntry(row); // keeps it safe locally and retried automatically instead of lost
+      entries.push(mapRowToEntry(row));
+      hintText.textContent = 'Saved locally — will sync automatically once you\'re back online.';
+      hintText.style.color = '';
     }
     await saveTimerState(); // timerState is already null here, so this clears storage
     renderTable();
   }
 
-  // Only worth recording as its own entry past a minimum length — a quick
-  // tab switch or accidental click shouldn't clutter the log with a
+  stopBtn.addEventListener('click', async ()=>{
+    if(!timerState) return;
+    await stopTimerInternal();
+    projectInput.value = '';
+    taskInput.value = '';
+  });
+
+  // Only worth recording as its own entry past a minimum length — a
+  // Idle Detection API false-start shouldn't clutter the log with a
   // 2-second "break".
   const MIN_BREAK_MS = 30 * 1000;
 
@@ -543,85 +618,41 @@
       totalMs: endTs - startTs,
       isBreak: true
     };
-    try{
-      const { data, error } = await supabaseClient
-        .from('entries')
-        .insert(mapEntryToRow(entry))
-        .select()
-        .single();
-      if(error) throw error;
+    const row = mapEntryToRow(entry);
+    const data = await insertEntryRow(row);
+    if(data){
       entries.push(mapRowToEntry(data));
-      renderTable();
-    }catch(e){
-      console.error('Could not log break entry', e);
+    }else{
+      queuePendingEntry(row);
+      entries.push(mapRowToEntry(row));
     }
+    renderTable();
   }
 
-  stopBtn.addEventListener('click', async ()=>{
-    if(!timerState) return;
-    await stopTimerInternal();
-    projectInput.value = '';
-    taskInput.value = '';
-  });
-
-  // Screen lock/off detection. Two layers:
-  //  1) Idle Detection API — precise (reports actual OS lock state, ignores
-  //     tab switches) but Chrome/Edge only, and needs a granted permission.
-  //     Safari and Firefox don't implement it at all: `IdleDetector` is
-  //     simply undefined there, so this layer silently does nothing.
-  //  2) Page Visibility API fallback — works in every browser. Locking the
-  //     screen reliably makes the page "hidden" everywhere, so this is used
-  //     whenever the Idle Detection API isn't active. Its trade-off is that
-  //     switching tabs/apps also counts as "hidden" — so instead of pausing
-  //     the moment it's hidden, this layer only records *when* it went
-  //     hidden and decides once it's visible again: a gap shorter than
-  //     TAB_HIDDEN_GRACE_MS (a quick tab switch or app-switcher glance) is
-  //     ignored entirely — the timer just kept running the whole time, no
-  //     entry gets split. Only a gap at or past that grace period is treated
-  //     as a real screen-off and logged/split, same as the Idle Detection API
-  //     path.
-  // On top of both, clicking anywhere after the screen comes back on is a
-  // safety net that logs/restarts the timer even if the automatic handling
-  // missed.
+  // Real screen lock/off detection — Idle Detection API only (Chrome/Edge,
+  // and only once the user grants the permission prompt). Its screenState
+  // reflects actual OS lock state and, unlike the Page Visibility API, does
+  // NOT fire from merely switching browser tabs or apps — so this is the
+  // only signal precise enough to auto-stop on. Safari/Firefox have no
+  // equivalent, so on those browsers the timer just keeps running through
+  // any hidden period, screen-off included, rather than guessing.
   //
-  // Screen-off only freezes the clock locally (accumulatedMs/segmentStartTs,
-  // a synchronous localStorage write) — it deliberately does NOT touch the
-  // network. Mobile OSes commonly suspend a locked screen's tab within a
-  // second or two, which was cutting off the Supabase insert/upload before
-  // it could finish (entries silently failing to log). Instead, the actual
-  // logging happens at screen-ON, when the tab is guaranteed to be running
-  // and online: the frozen segment is saved as its own finished entry
-  // (ending at the moment the screen went off, not "now"), and a brand-new
-  // timer starts for the same task from the moment the screen came back on.
-  // The gap between off and on is never counted in either entry — i.e. it's
-  // treated as a break.
+  // On lock: stop the running timer and log it, same as pressing Stop. On
+  // unlock: start a fresh timer for the same project/task automatically,
+  // and log the screen-off gap itself as its own "Screen off" break entry
+  // so the time in between is still accounted for.
   //
-  // Exception: while a Lunch/Tea break is running, screen-off is the whole
-  // point (you've stepped away), so it must count toward the break instead
-  // of interrupting it — pauseForScreenOff below is a no-op for breaks, and
-  // the elapsed time keeps accumulating into that same break entry.
+  // Exception: while a Lunch/Tea break is already running, screen-off is
+  // the whole point (you've stepped away) — pauseForScreenOff below is a
+  // no-op for breaks, so the break just keeps counting through it instead
+  // of being split.
   let idleDetector = null;
   let idlePermissionRequested = false;
-  let usingIdleDetector = false;
 
-  // Matches the Idle Detection API threshold below, so both layers agree on
-  // what counts as "actually away" versus a brief tab switch.
-  const TAB_HIDDEN_GRACE_MS = 60000;
-  let hiddenAt = null;
-
-  // A page refresh/navigation also fires visibilitychange(hidden) right
-  // before the page tears down — indistinguishable from a real screen lock
-  // by that event alone. beforeunload/pagehide fire earlier in that specific
-  // sequence, so flagging them lets the visibilitychange handler below tell
-  // "actually leaving the page" apart from "screen locked" and skip pausing.
-  let isUnloading = false;
-  window.addEventListener('beforeunload', ()=>{ isUnloading = true; });
-  window.addEventListener('pagehide', ()=>{ isUnloading = true; });
-
-  async function pauseForScreenOff(reason, atTs){
+  async function pauseForScreenOff(reason){
     if(!timerState || timerState.segmentStartTs == null) return; // nothing running to pause
     if(timerState.isBreak) return; // let a Lunch/Tea break keep counting through screen-off instead of pausing it
-    const pauseTs = atTs != null ? atTs : Date.now();
+    const pauseTs = Date.now();
     timerState.accumulatedMs += pauseTs - timerState.segmentStartTs;
     timerState.segmentStartTs = null;
     timerState.pausedAt = pauseTs; // the real "end time" of this segment, used when we log it at resume
@@ -661,9 +692,8 @@
       idleDetector = new IdleDetector();
       idleDetector.addEventListener('change', onIdleChange);
       await idleDetector.start({ threshold: 60000 });
-      usingIdleDetector = true;
     }catch(e){
-      console.warn('Idle Detection API unavailable, using tab-visibility fallback instead:', e);
+      console.warn('Idle Detection API unavailable — screen-off will not auto-stop the timer on this browser:', e);
     }
   }
 
@@ -673,24 +703,16 @@
     else if(screenState === 'unlocked') await resumeForScreenOn();
   }
 
-  document.addEventListener('visibilitychange', async ()=>{
-    if(usingIdleDetector) return; // handled more precisely by the Idle Detection API instead
-    if(isUnloading) return; // this hidden event is from a refresh/navigation, not a real screen lock
-    if(document.hidden){
-      hiddenAt = Date.now();
-      return;
-    }
-    if(hiddenAt == null) return; // nothing was pending (e.g. an unload flag suppressed the hide)
-    const wasHiddenAt = hiddenAt;
-    hiddenAt = null;
-    if(Date.now() - wasHiddenAt < TAB_HIDDEN_GRACE_MS) return; // brief tab switch — timer kept running, nothing to split
-    await pauseForScreenOff('turned off', wasHiddenAt);
-    await resumeForScreenOn();
-  });
-
   // Fallback restart trigger: clicking anywhere restarts an auto-stopped
-  // timer if it hasn't already restarted automatically.
+  // timer if the 'unlocked' event happened to get missed.
   document.addEventListener('click', ()=>{ resumeForScreenOn(); });
+
+  // Coming back to the tab is a good moment to retry anything stuck in the
+  // local save-retry queue, since network/auth have likely recovered by
+  // then. Tab switches/refreshes themselves never touch the running timer.
+  document.addEventListener('visibilitychange', ()=>{
+    if(!document.hidden) flushPendingEntries();
+  });
 
   async function deleteEntry(id){
     const entry = entries.find(e=>e.id === id);
